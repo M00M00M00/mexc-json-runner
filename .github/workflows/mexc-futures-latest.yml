@@ -30,7 +30,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   collect:
@@ -40,6 +40,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -61,10 +63,28 @@ jobs:
             "${{ inputs.hist_seconds }}"
 
       - name: Rename output
+        id: rename_output
         run: |
           TS="$(date -u +%Y%m%dT%H%M%SZ)"
           SAFE_SYMBOL="$(echo "${{ inputs.symbol }}" | tr '/' '_' | tr -d ' ')"
-          mv latest.json "latest-${SAFE_SYMBOL}-${TS}.json"
+          FILE="latest-${SAFE_SYMBOL}-${TS}.json"
+          mv latest.json "${FILE}"
+          echo "filename=${FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Save output in repository
+        run: |
+          mkdir -p outputs
+          cp "${{ steps.rename_output.outputs.filename }}" outputs/latest.json
+          cp "${{ steps.rename_output.outputs.filename }}" "outputs/${{ steps.rename_output.outputs.filename }}"
+
+      - name: Commit output JSON
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git add outputs/latest.json "outputs/${{ steps.rename_output.outputs.filename }}"
+          git commit -m "chore: update outputs for ${{ inputs.symbol }} (run ${{ github.run_id }})" || echo "No changes to commit"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
