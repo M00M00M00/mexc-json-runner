@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -6,8 +7,15 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 
-# Binance USD-M Futures REST
-BASE = "https://fapi.binance.com"
+# Binance USD-M Futures REST base URLs.
+# Priority can be overridden by env `BINANCE_BASE_URLS` (comma-separated) or `BINANCE_BASE_URL`.
+DEFAULT_BINANCE_BASE_URLS = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
+]
 
 
 # ---------------------------
@@ -59,6 +67,27 @@ def _safe_depth_limit(limit: int) -> int:
     return 1000
 
 
+def _get_binance_base_urls() -> List[str]:
+    raw_list = os.getenv("BINANCE_BASE_URLS", "").strip()
+    if raw_list:
+        candidates = [x.strip().rstrip("/") for x in raw_list.split(",") if x.strip()]
+    else:
+        one = os.getenv("BINANCE_BASE_URL", "").strip()
+        if one:
+            candidates = [one.rstrip("/")]
+        else:
+            candidates = list(DEFAULT_BINANCE_BASE_URLS)
+
+    # De-duplicate while preserving order.
+    seen = set()
+    out = []
+    for url in candidates:
+        if url and url not in seen:
+            out.append(url)
+            seen.add(url)
+    return out
+
+
 # ---------------------------
 # HTTP helpers
 # ---------------------------
@@ -78,19 +107,49 @@ def _get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
     raise last_err
 
 
+def _binance_get(path: str, params=None, timeout=10, retries=3, sleep=0.25):
+    if not path.startswith("/"):
+        path = "/" + path
+
+    errors = []
+    restricted_hits = 0
+    bases = _get_binance_base_urls()
+
+    for base in bases:
+        url = f"{base}{path}"
+        try:
+            return _get_json(url, params=params, timeout=timeout, retries=retries, sleep=sleep)
+        except Exception as e:
+            msg = str(e)
+            errors.append(f"{base}: {msg}")
+            if "HTTP 451" in msg:
+                restricted_hits += 1
+            continue
+
+    hint = ""
+    if errors and restricted_hits == len(errors):
+        hint = (
+            " Binance endpoints rejected this runner location (HTTP 451). "
+            "Use a non-restricted self-hosted runner or set BINANCE_BASE_URLS "
+            "to a relay/proxy endpoint."
+        )
+    last = " | ".join(errors[-3:]) if errors else "unknown error"
+    raise RuntimeError(f"All Binance base URLs failed.{hint} Last errors: {last}")
+
+
 # ---------------------------
 # Binance endpoints
 # ---------------------------
 def get_server_time_ms():
-    data = _get_json(f"{BASE}/fapi/v1/time")
+    data = _binance_get("/fapi/v1/time")
     return int(data["serverTime"])
 
 
 def get_klines(symbol: str, interval: str, bars: int):
     symbol = _normalize_symbol(symbol)
     bars = max(1, int(bars))
-    data = _get_json(
-        f"{BASE}/fapi/v1/klines",
+    data = _binance_get(
+        "/fapi/v1/klines",
         params={"symbol": symbol, "interval": interval, "limit": bars},
     )
 
@@ -113,24 +172,24 @@ def get_klines(symbol: str, interval: str, bars: int):
 
 def get_ticker_24h(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _get_json(f"{BASE}/fapi/v1/ticker/24hr", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/ticker/24hr", params={"symbol": symbol})
 
 
 def get_book_ticker(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _get_json(f"{BASE}/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
 
 
 def get_premium_index(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _get_json(f"{BASE}/fapi/v1/premiumIndex", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/premiumIndex", params={"symbol": symbol})
 
 
 def get_funding_history(symbol: str, n: int = 24):
     symbol = _normalize_symbol(symbol)
     limit = max(1, min(1000, int(n)))
-    data = _get_json(
-        f"{BASE}/fapi/v1/fundingRate",
+    data = _binance_get(
+        "/fapi/v1/fundingRate",
         params={"symbol": symbol, "limit": limit},
     )
     if not isinstance(data, list):
@@ -141,23 +200,23 @@ def get_funding_history(symbol: str, n: int = 24):
 
 def get_open_interest(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _get_json(f"{BASE}/fapi/v1/openInterest", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/openInterest", params={"symbol": symbol})
 
 
 def get_exchange_info(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _get_json(f"{BASE}/fapi/v1/exchangeInfo", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/exchangeInfo", params={"symbol": symbol})
 
 
 def get_depth(symbol: str, limit: int = 20):
     symbol = _normalize_symbol(symbol)
-    return _get_json(f"{BASE}/fapi/v1/depth", params={"symbol": symbol, "limit": _safe_depth_limit(limit)})
+    return _binance_get("/fapi/v1/depth", params={"symbol": symbol, "limit": _safe_depth_limit(limit)})
 
 
 def get_trades(symbol: str, limit: int = 100):
     symbol = _normalize_symbol(symbol)
     n = max(1, min(1000, int(limit)))
-    return _get_json(f"{BASE}/fapi/v1/trades", params={"symbol": symbol, "limit": n})
+    return _binance_get("/fapi/v1/trades", params={"symbol": symbol, "limit": n})
 
 
 def _extract_symbol_info(exchange_info: Dict[str, Any], symbol: str) -> Dict[str, Any]:

@@ -44,6 +44,38 @@ def test_get_json_retries_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_binance_get_fallbacks_on_451(monkeypatch):
+    monkeypatch.setenv("BINANCE_BASE_URLS", "https://blocked.example,https://ok.example")
+    calls = []
+
+    def fake_get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
+        calls.append(url)
+        if url.startswith("https://blocked.example"):
+            raise RuntimeError("HTTP 451: restricted location")
+        return {"serverTime": 1700000000000}
+
+    monkeypatch.setattr(collector, "_get_json", fake_get_json)
+    out = collector._binance_get("/fapi/v1/time")
+
+    assert out["serverTime"] == 1700000000000
+    assert calls == [
+        "https://blocked.example/fapi/v1/time",
+        "https://ok.example/fapi/v1/time",
+    ]
+
+
+def test_binance_get_raises_helpful_error_when_all_451(monkeypatch):
+    monkeypatch.setenv("BINANCE_BASE_URLS", "https://blocked1.example,https://blocked2.example")
+
+    def fake_get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
+        raise RuntimeError("HTTP 451: restricted location")
+
+    monkeypatch.setattr(collector, "_get_json", fake_get_json)
+
+    with pytest.raises(RuntimeError, match="runner location"):
+        collector._binance_get("/fapi/v1/time")
+
+
 def test_get_klines_transforms_binance_payload(monkeypatch):
     kline_payload = [
         [1700000000000, "100", "110", "90", "105", "11", 1700000059999, "0", 0, "0", "0", "0"],
