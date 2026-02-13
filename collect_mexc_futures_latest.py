@@ -1,13 +1,62 @@
 import json
-import time
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 import requests
-import pandas as pd
 
-BASE = "https://api.mexc.com"
+# Binance USD-M Futures REST
+BASE = "https://fapi.binance.com"
+
+
+# ---------------------------
+# Generic helpers
+# ---------------------------
+def _to_float(x: Any):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _iso_from_ms(ms: int) -> str:
+    return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_symbol(symbol: str) -> str:
+    # Supports legacy user input like BTC_USDT, btc/usdt, BTC-USDT.
+    s = "".join(ch for ch in str(symbol).strip().upper() if ch.isalnum())
+    if not s:
+        raise ValueError("symbol is empty")
+    return s
+
+
+def _interval_to_seconds(interval: str) -> int:
+    mapping = {
+        "1m": 60,
+        "3m": 180,
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "1h": 3600,
+        "4h": 14400,
+        "1d": 86400,
+    }
+    if interval not in mapping:
+        raise ValueError(f"Unsupported interval: {interval}. Choose one of {list(mapping.keys())}")
+    return mapping[interval]
+
+
+def _safe_depth_limit(limit: int) -> int:
+    allowed = [5, 10, 20, 50, 100, 500, 1000]
+    n = int(limit)
+    if n in allowed:
+        return n
+    for x in allowed:
+        if n <= x:
+            return x
+    return 1000
 
 
 # ---------------------------
@@ -15,7 +64,7 @@ BASE = "https://api.mexc.com"
 # ---------------------------
 def _get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
     last_err = None
-    for _ in range(retries):
+    for _ in range(max(1, retries)):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code != 200:
@@ -29,159 +78,215 @@ def _get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
     raise last_err
 
 
-def _get_data(url, params=None):
-    data = _get_json(url, params=params)
-    if not data.get("success", False):
-        raise RuntimeError(f"API failed: {data}")
-    return data["data"]
-
-
+# ---------------------------
+# Binance endpoints
+# ---------------------------
 def get_server_time_ms():
-    return int(_get_data(f"{BASE}/api/v1/contract/ping"))
-
-
-# ---------------------------
-# Market endpoints
-# ---------------------------
-def _interval_to_seconds(interval: str) -> int:
-    m = {
-        "Min1": 60,
-        "Min5": 300,
-        "Min15": 900,
-        "Min30": 1800,
-        "Min60": 3600,
-        "Hour4": 14400,
-        "Day1": 86400,
-    }
-    if interval not in m:
-        raise ValueError(f"Unsupported interval: {interval}. Choose one of {list(m.keys())}")
-    return m[interval]
+    data = _get_json(f"{BASE}/fapi/v1/time")
+    return int(data["serverTime"])
 
 
 def get_klines(symbol: str, interval: str, bars: int):
-    server_ms = get_server_time_ms()
-    end_sec = server_ms // 1000
-    step = _interval_to_seconds(interval)
-    start_sec = end_sec - (bars * step)
+    symbol = _normalize_symbol(symbol)
+    bars = max(1, int(bars))
+    data = _get_json(
+        f"{BASE}/fapi/v1/klines",
+        params={"symbol": symbol, "interval": interval, "limit": bars},
+    )
 
-    url = f"{BASE}/api/v1/contract/kline/{symbol}"
-    params = {"interval": interval, "start": start_sec, "end": end_sec}
-    resp = _get_json(url, params=params)
-    if not resp.get("success", False):
-        raise RuntimeError(f"Kline failed: {resp}")
-    k = resp["data"]
-
-    df = pd.DataFrame({
-        "ts": pd.to_datetime(k["time"], unit="s", utc=True),
-        "o": k.get("open", []),
-        "h": k.get("high", []),
-        "l": k.get("low", []),
-        "c": k.get("close", []),
-        "v": k.get("vol", []),
-    })
-
-    for col in ["o", "h", "l", "c", "v"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if len(df) > bars:
-        df = df.iloc[-bars:].reset_index(drop=True)
-
-    df["ts"] = df["ts"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return df.to_dict(orient="records")
+    out = []
+    for k in data[-bars:]:
+        if not isinstance(k, list) or len(k) < 6:
+            continue
+        out.append(
+            {
+                "ts": _iso_from_ms(k[0]),
+                "o": _to_float(k[1]),
+                "h": _to_float(k[2]),
+                "l": _to_float(k[3]),
+                "c": _to_float(k[4]),
+                "v": _to_float(k[5]),
+            }
+        )
+    return out
 
 
-def get_ticker(symbol: str):
-    data = _get_data(f"{BASE}/api/v1/contract/ticker", params={"symbol": symbol})
-    if isinstance(data, list):
-        for it in data:
-            if it.get("symbol") == symbol:
-                return it
-        return {}
-    if isinstance(data, dict) and data.get("symbol") == symbol:
-        return data
-    return data if isinstance(data, dict) else {}
+def get_ticker_24h(symbol: str):
+    symbol = _normalize_symbol(symbol)
+    return _get_json(f"{BASE}/fapi/v1/ticker/24hr", params={"symbol": symbol})
 
 
-def get_funding(symbol: str):
-    return _get_data(f"{BASE}/api/v1/contract/funding_rate/{symbol}")
+def get_book_ticker(symbol: str):
+    symbol = _normalize_symbol(symbol)
+    return _get_json(f"{BASE}/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
+
+
+def get_premium_index(symbol: str):
+    symbol = _normalize_symbol(symbol)
+    return _get_json(f"{BASE}/fapi/v1/premiumIndex", params={"symbol": symbol})
 
 
 def get_funding_history(symbol: str, n: int = 24):
-    page_size = max(20, min(1000, n))
-    data = _get_data(
-        f"{BASE}/api/v1/contract/funding_rate/history",
-        params={"symbol": symbol, "page_num": 1, "page_size": page_size},
+    symbol = _normalize_symbol(symbol)
+    limit = max(1, min(1000, int(n)))
+    data = _get_json(
+        f"{BASE}/fapi/v1/fundingRate",
+        params={"symbol": symbol, "limit": limit},
     )
-    if isinstance(data, dict) and "resultList" in data and isinstance(data["resultList"], list):
-        data["resultList"] = data["resultList"][:n]
-    return data
+    if not isinstance(data, list):
+        return []
+    # Keep latest first for quick consumers.
+    return sorted(data, key=lambda x: int(x.get("fundingTime", 0)), reverse=True)[:n]
 
 
-def get_index(symbol: str):
-    return _get_data(f"{BASE}/api/v1/contract/index_price/{symbol}")
+def get_open_interest(symbol: str):
+    symbol = _normalize_symbol(symbol)
+    return _get_json(f"{BASE}/fapi/v1/openInterest", params={"symbol": symbol})
 
 
-def get_fair(symbol: str):
-    return _get_data(f"{BASE}/api/v1/contract/fair_price/{symbol}")
+def get_exchange_info(symbol: str):
+    symbol = _normalize_symbol(symbol)
+    return _get_json(f"{BASE}/fapi/v1/exchangeInfo", params={"symbol": symbol})
 
 
 def get_depth(symbol: str, limit: int = 20):
-    return _get_data(f"{BASE}/api/v1/contract/depth/{symbol}", params={"limit": int(limit)})
-
-
-def get_depth_commits(symbol: str, n: int = 60):
-    return _get_data(f"{BASE}/api/v1/contract/depth_commits/{symbol}/{int(n)}")
+    symbol = _normalize_symbol(symbol)
+    return _get_json(f"{BASE}/fapi/v1/depth", params={"symbol": symbol, "limit": _safe_depth_limit(limit)})
 
 
 def get_trades(symbol: str, limit: int = 100):
-    return _get_data(f"{BASE}/api/v1/contract/deals/{symbol}", params={"limit": int(min(limit, 100))})
+    symbol = _normalize_symbol(symbol)
+    n = max(1, min(1000, int(limit)))
+    return _get_json(f"{BASE}/fapi/v1/trades", params={"symbol": symbol, "limit": n})
 
 
-def get_contract_info(symbol: str):
-    data = _get_data(f"{BASE}/api/v1/contract/detail", params={"symbol": symbol})
-    if isinstance(data, dict) and data.get("symbol") == symbol:
-        return data
-    if isinstance(data, list):
-        for it in data:
-            if it.get("symbol") == symbol:
-                return it
-    return data if isinstance(data, dict) else {}
+def _extract_symbol_info(exchange_info: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    symbol = _normalize_symbol(symbol)
+    symbols = exchange_info.get("symbols", []) if isinstance(exchange_info, dict) else []
+    for item in symbols:
+        if isinstance(item, dict) and item.get("symbol") == symbol:
+            return item
+    return {}
+
+
+def build_market_info(contract: Dict[str, Any]) -> Dict[str, Any]:
+    filters = {}
+    for f in contract.get("filters", []) or []:
+        if isinstance(f, dict) and f.get("filterType"):
+            filters[f["filterType"]] = f
+
+    price_filter = filters.get("PRICE_FILTER", {})
+    lot_filter = filters.get("LOT_SIZE", {})
+
+    tick_size = _to_float(price_filter.get("tickSize"))
+    min_price = _to_float(price_filter.get("minPrice"))
+    max_price = _to_float(price_filter.get("maxPrice"))
+
+    step_size = _to_float(lot_filter.get("stepSize"))
+    min_qty = _to_float(lot_filter.get("minQty"))
+    max_qty = _to_float(lot_filter.get("maxQty"))
+
+    return {
+        "symbol": contract.get("symbol"),
+        "pair": contract.get("pair"),
+        "contractType": contract.get("contractType"),
+        "status": contract.get("status"),
+        "baseAsset": contract.get("baseAsset"),
+        "quoteAsset": contract.get("quoteAsset"),
+        "marginAsset": contract.get("marginAsset"),
+        "onboardDate": contract.get("onboardDate"),
+        "tickSize": tick_size,
+        "minPrice": min_price,
+        "maxPrice": max_price,
+        "stepSize": step_size,
+        "minQty": min_qty,
+        "maxQty": max_qty,
+        "pricePrecision": contract.get("pricePrecision"),
+        "quantityPrecision": contract.get("quantityPrecision"),
+        # Compatibility aliases for existing downstream prompt/agent.
+        "priceUnit": tick_size,
+        "volUnit": step_size,
+        "minVol": min_qty,
+        "contractSize": _to_float(contract.get("contractSize")) or 1.0,
+        "priceScale": contract.get("pricePrecision"),
+        "volScale": contract.get("quantityPrecision"),
+        "maxLeverage": _to_float(contract.get("maxLeverage")),
+        "filters": contract.get("filters", []),
+    }
+
+
+def build_ticker_snapshot(
+    ticker_24h: Dict[str, Any],
+    book_ticker: Dict[str, Any],
+    premium_index: Dict[str, Any],
+    open_interest: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "symbol": ticker_24h.get("symbol") or book_ticker.get("symbol") or premium_index.get("symbol"),
+        "lastPrice": _to_float(ticker_24h.get("lastPrice")),
+        "bid1": _to_float(book_ticker.get("bidPrice")),
+        "ask1": _to_float(book_ticker.get("askPrice")),
+        "volume24": _to_float(ticker_24h.get("volume")),
+        "amount24": _to_float(ticker_24h.get("quoteVolume")),
+        "high24Price": _to_float(ticker_24h.get("highPrice")),
+        "lower24Price": _to_float(ticker_24h.get("lowPrice")),
+        "riseFallRate": _to_float(ticker_24h.get("priceChangePercent")),
+        "indexPrice": _to_float(premium_index.get("indexPrice")),
+        "fairPrice": _to_float(premium_index.get("markPrice")),
+        "fundingRate": _to_float(premium_index.get("lastFundingRate")),
+        "holdVol": _to_float(open_interest.get("openInterest")),
+        "nextFundingTime": premium_index.get("nextFundingTime"),
+        "timestamp": ticker_24h.get("closeTime") or premium_index.get("time") or open_interest.get("time"),
+    }
 
 
 # ---------------------------
 # Polling histories (Δ)
 # ---------------------------
 def sample_ticker_history(symbol: str, seconds: int = 60, step_sec: float = 2.0):
+    symbol = _normalize_symbol(symbol)
     out = []
-    end = time.time() + max(1, seconds)
+    end = time.time() + max(1, int(seconds))
+
     while time.time() < end:
-        tk = get_ticker(symbol)
-        now_ms = get_server_time_ms()
-        out.append({
-            "t": int(now_ms),
-            "lastPrice": tk.get("lastPrice"),
-            "bid1": tk.get("bid1"),
-            "ask1": tk.get("ask1"),
-            "holdVol": tk.get("holdVol"),
-            "fundingRate": tk.get("fundingRate"),
-            "indexPrice": tk.get("indexPrice"),
-            "fairPrice": tk.get("fairPrice"),
-        })
+        ticker_24h = get_ticker_24h(symbol)
+        book_ticker = get_book_ticker(symbol)
+        premium_index = get_premium_index(symbol)
+        open_interest = get_open_interest(symbol)
+        tk = build_ticker_snapshot(ticker_24h, book_ticker, premium_index, open_interest)
+
+        now_ms = int(premium_index.get("time") or open_interest.get("time") or get_server_time_ms())
+        out.append(
+            {
+                "t": now_ms,
+                "lastPrice": tk.get("lastPrice"),
+                "bid1": tk.get("bid1"),
+                "ask1": tk.get("ask1"),
+                "holdVol": tk.get("holdVol"),
+                "fundingRate": tk.get("fundingRate"),
+                "indexPrice": tk.get("indexPrice"),
+                "fairPrice": tk.get("fairPrice"),
+            }
+        )
         time.sleep(step_sec)
     return out
 
 
 def sample_depth_history(symbol: str, seconds: int = 60, step_sec: float = 2.0, levels: int = 20):
+    symbol = _normalize_symbol(symbol)
     out = []
-    end = time.time() + max(1, seconds)
+    end = time.time() + max(1, int(seconds))
+
     while time.time() < end:
         d = get_depth(symbol, limit=levels)
-        out.append({
-            "timestamp": d.get("timestamp"),
-            "version": d.get("version"),
-            "bids": d.get("bids", [])[:levels],
-            "asks": d.get("asks", [])[:levels],
-        })
+        out.append(
+            {
+                "timestamp": d.get("E") or d.get("T") or get_server_time_ms(),
+                "version": d.get("lastUpdateId"),
+                "bids": (d.get("bids", []) or [])[:levels],
+                "asks": (d.get("asks", []) or [])[:levels],
+            }
+        )
         time.sleep(step_sec)
     return out
 
@@ -189,13 +294,6 @@ def sample_depth_history(symbol: str, seconds: int = 60, step_sec: float = 2.0, 
 # ---------------------------
 # Feature engineering helpers
 # ---------------------------
-def _to_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
 def _sum_sizes(levels: List[List[Any]]) -> float:
     s = 0.0
     for lv in levels or []:
@@ -216,10 +314,6 @@ def _best_levels(orderbook: Dict[str, Any]) -> Tuple[float, float]:
 
 
 def _near_band_levels(levels: List[List[Any]], p: float, band_pct: float, side: str) -> List[List[Any]]:
-    """
-    Filter levels within ±band_pct of price p.
-    side is 'bids' or 'asks' (not used, but helpful for readability)
-    """
     out = []
     if p is None:
         return out
@@ -238,9 +332,6 @@ def _near_band_levels(levels: List[List[Any]], p: float, band_pct: float, side: 
 
 
 def _top_wall(levels: List[List[Any]]) -> Dict[str, Any]:
-    """
-    Return the single largest wall in given levels by size.
-    """
     best = {"price": None, "size": None}
     max_sz = -1.0
     for px, sz in levels:
@@ -283,21 +374,14 @@ def compute_orderbook_features(orderbook: Dict[str, Any], p: float, band_pct: fl
             "askCount": len(near_asks),
             "topBidWall": top_bid_wall,
             "topAskWall": top_ask_wall,
-        }
+        },
     }
 
 
 def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: float, levels: int = 20):
-    """
-    From polled depth snapshots (time series), approximate:
-    - wall persistence: how often top wall stays at same/near price
-    - wall churn: frequency of top wall price changes
-    - size stability: coeff of variation (rough) for top wall size
-    """
     if not depth_snapshots:
         return {"available": False}
 
-    # For each snapshot, find top wall in near band
     walls = []
     for snap in depth_snapshots:
         bids = (snap.get("bids", []) or [])[:levels]
@@ -313,6 +397,7 @@ def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: flo
         sizes = [w[wall_key]["size"] for w in walls if w.get(wall_key, {}).get("size") is not None]
         if len(prices) < 3:
             return {"samples": len(prices), "persistRate": None, "churnRate": None, "sizeCv": None}
+
         same = 0
         changes = 0
         for i in range(1, len(prices)):
@@ -320,9 +405,10 @@ def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: flo
                 same += 1
             else:
                 changes += 1
+
         persist_rate = same / (len(prices) - 1)
         churn_rate = changes / (len(prices) - 1)
-        # size CV (std/mean)
+
         mean_sz = sum(sizes) / len(sizes) if sizes else 0.0
         if mean_sz > 0:
             var = sum((s - mean_sz) ** 2 for s in sizes) / len(sizes)
@@ -330,6 +416,7 @@ def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: flo
             cv = std / mean_sz
         else:
             cv = None
+
         return {"samples": len(prices), "persistRate": persist_rate, "churnRate": churn_rate, "sizeCv": cv}
 
     return {
@@ -340,9 +427,6 @@ def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: flo
 
 
 def compute_trade_features(trades: List[Dict[str, Any]]):
-    """
-    Use MEXC field T: 1=buy, 2=sell (aggressor-ish)
-    """
     if not trades:
         return {"available": False}
 
@@ -350,22 +434,32 @@ def compute_trade_features(trades: List[Dict[str, Any]]):
     sell_vol = 0.0
     buy_cnt = 0
     sell_cnt = 0
-    max_trade = {"price": None, "vol": None, "T": None}
+    max_trade = {"price": None, "vol": None, "aggressorSide": None}
 
     for tr in trades:
-        px = _to_float(tr.get("p") or tr.get("price"))
-        v = _to_float(tr.get("v") or tr.get("vol") or tr.get("volume"))
-        t = tr.get("T")  # 1 or 2
+        px = _to_float(tr.get("price") or tr.get("p"))
+        v = _to_float(tr.get("qty") or tr.get("v") or tr.get("vol") or tr.get("volume"))
         if v is None:
             continue
 
-        if max_trade["vol"] is None or v > max_trade["vol"]:
-            max_trade = {"price": px, "vol": v, "T": t}
+        aggressor_side = None
+        if "isBuyerMaker" in tr:
+            aggressor_side = "SELL" if bool(tr.get("isBuyerMaker")) else "BUY"
+        else:
+            # Legacy fallback (MEXC style): T: 1=buy, 2=sell
+            t = tr.get("T")
+            if t == 1:
+                aggressor_side = "BUY"
+            elif t == 2:
+                aggressor_side = "SELL"
 
-        if t == 1:
+        if max_trade["vol"] is None or v > max_trade["vol"]:
+            max_trade = {"price": px, "vol": v, "aggressorSide": aggressor_side}
+
+        if aggressor_side == "BUY":
             buy_vol += v
             buy_cnt += 1
-        elif t == 2:
+        elif aggressor_side == "SELL":
             sell_vol += v
             sell_cnt += 1
 
@@ -381,7 +475,7 @@ def compute_trade_features(trades: List[Dict[str, Any]]):
         "sellCnt": sell_cnt,
         "buyVolRatio": buy_ratio,
         "sellVolRatio": sell_ratio,
-        "maxTrade": max_trade
+        "maxTrade": max_trade,
     }
 
 
@@ -407,10 +501,9 @@ def compute_oi_features(ticker_hist: List[Dict[str, Any]]):
     px_change = last[-1] - last[0]
     px_change_pct = (px_change / last[0] * 100.0) if last[0] != 0 else None
 
-    # crude "leverage chase" flag: OI increases while price moves fast
     chase_flag = None
     if oi_change_pct is not None and px_change_pct is not None:
-        chase_flag = (oi_change_pct > 0.3 and abs(px_change_pct) > 0.25)
+        chase_flag = oi_change_pct > 0.3 and abs(px_change_pct) > 0.25
 
     return {
         "available": True,
@@ -422,14 +515,11 @@ def compute_oi_features(ticker_hist: List[Dict[str, Any]]):
         "pxStart": last[0],
         "pxEnd": last[-1],
         "pxChangePct": px_change_pct,
-        "leverageChaseFlag": chase_flag
+        "leverageChaseFlag": chase_flag,
     }
 
 
 def compute_context_features(klines_15m: List[Dict[str, Any]], klines_5m: List[Dict[str, Any]]):
-    """
-    Simple range/position metrics for LLM to use quickly.
-    """
     def _hlc(ks):
         highs = [_to_float(x.get("h")) for x in ks if _to_float(x.get("h")) is not None]
         lows = [_to_float(x.get("l")) for x in ks if _to_float(x.get("l")) is not None]
@@ -454,7 +544,6 @@ def compute_context_features(klines_15m: List[Dict[str, Any]], klines_5m: List[D
     last5 = c5[-1]
     pos5 = (last5 - r5_lo) / (r5_hi - r5_lo) if (r5_hi - r5_lo) > 0 else None
 
-    # trend proxy: last close vs mean close
     mean15 = sum(c15) / len(c15)
     mean5 = sum(c5) / len(c5)
 
@@ -468,31 +557,40 @@ def compute_context_features(klines_15m: List[Dict[str, Any]], klines_5m: List[D
 # ---------------------------
 # Bundle builder
 # ---------------------------
-def make_latest(symbol: str,
-                bars_1m: int = 240,
-                bars_5m: int = 120,
-                bars_15m: int = 80,
-                depth_levels: int = 20,
-                trades_n: int = 100,
-                depth_commits_n: int = 60,
-                hist_seconds: int = 60,
-                hist_step_sec: float = 2.0,
-                enable_poll_history: bool = True):
+def make_latest(
+    symbol: str,
+    bars_1m: int = 240,
+    bars_5m: int = 120,
+    bars_15m: int = 80,
+    depth_levels: int = 20,
+    trades_n: int = 100,
+    depth_commits_n: int = 60,  # kept for API compatibility, unused on Binance REST
+    hist_seconds: int = 60,
+    hist_step_sec: float = 2.0,
+    enable_poll_history: bool = True,
+):
+    del depth_commits_n
+
+    symbol = _normalize_symbol(symbol)
     now_ms = get_server_time_ms()
 
-    ticker = get_ticker(symbol)
-    funding = get_funding(symbol)
+    ticker_24h = get_ticker_24h(symbol)
+    book_ticker = get_book_ticker(symbol)
+    premium_index = get_premium_index(symbol)
     funding_hist = get_funding_history(symbol, n=24)
-    index_price = get_index(symbol)
-    fair_price = get_fair(symbol)
-    depth = get_depth(symbol, limit=depth_levels)
-    depth_commits = get_depth_commits(symbol, n=depth_commits_n)
-    trades = get_trades(symbol, limit=trades_n)
-    contract = get_contract_info(symbol)
+    open_interest = get_open_interest(symbol)
 
-    k1 = get_klines(symbol, "Min1", bars_1m)
-    k5 = get_klines(symbol, "Min5", bars_5m)
-    k15 = get_klines(symbol, "Min15", bars_15m)
+    exchange_info = get_exchange_info(symbol)
+    contract = _extract_symbol_info(exchange_info, symbol)
+
+    depth = get_depth(symbol, limit=depth_levels)
+    trades = get_trades(symbol, limit=trades_n)
+
+    k1 = get_klines(symbol, "1m", bars_1m)
+    k5 = get_klines(symbol, "5m", bars_5m)
+    k15 = get_klines(symbol, "15m", bars_15m)
+
+    ticker = build_ticker_snapshot(ticker_24h, book_ticker, premium_index, open_interest)
 
     ticker_hist = []
     depth_hist = []
@@ -500,15 +598,7 @@ def make_latest(symbol: str,
         ticker_hist = sample_ticker_history(symbol, seconds=hist_seconds, step_sec=hist_step_sec)
         depth_hist = sample_depth_history(symbol, seconds=hist_seconds, step_sec=hist_step_sec, levels=depth_levels)
 
-    market_info = {
-        "priceUnit": contract.get("priceUnit"),
-        "volUnit": contract.get("volUnit"),
-        "minVol": contract.get("minVol"),
-        "contractSize": contract.get("contractSize"),
-        "priceScale": contract.get("priceScale"),
-        "volScale": contract.get("volScale"),
-        "maxLeverage": contract.get("maxLeverage"),
-    }
+    market_info = build_market_info(contract)
 
     metrics = {
         "openInterestNow": ticker.get("holdVol"),
@@ -517,20 +607,18 @@ def make_latest(symbol: str,
         "fundingRateHistory": funding_hist,
     }
 
-    # Determine P for feature calc
-    P = _to_float(ticker.get("lastPrice")) or _to_float(ticker.get("fairPrice")) or _to_float(fair_price.get("fairPrice"))
-    if P is None and k1:
-        P = _to_float(k1[-1].get("c"))
+    p = ticker.get("lastPrice") or ticker.get("fairPrice") or ticker.get("indexPrice")
+    if p is None and k1:
+        p = _to_float(k1[-1].get("c"))
 
-    # ---- Features ----
-    ob_feat = compute_orderbook_features(depth, P, band_pct=0.0015, topN=depth_levels) if P else {"available": False}
-    ob_hist_feat = compute_depth_history_features(depth_hist, P, levels=depth_levels) if P else {"available": False}
+    ob_feat = compute_orderbook_features(depth, p, band_pct=0.0015, topN=depth_levels) if p else {"available": False}
+    ob_hist_feat = compute_depth_history_features(depth_hist, p, levels=depth_levels) if p else {"available": False}
     tr_feat = compute_trade_features(trades[:40])
     oi_feat = compute_oi_features(ticker_hist)
     ctx_feat = compute_context_features(k15, k5)
 
     features = {
-        "P_used": P,
+        "P_used": p,
         "orderbook": ob_feat,
         "orderbookHistory": ob_hist_feat,
         "trades": tr_feat,
@@ -540,40 +628,38 @@ def make_latest(symbol: str,
 
     bundle = {
         "meta": {
-            "exchange": "MEXC",
-            "market": "FUTURES",
+            "exchange": "BINANCE",
+            "market": "USD_M_FUTURES",
             "symbol": symbol,
-            "generated_at": datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "generated_at": _iso_from_ms(now_ms),
         },
         "marketInfo": market_info,
         "price": {
             "ticker": ticker,
-            "funding": funding,
-            "index": index_price,
-            "fair": fair_price,
+            "ticker24h": ticker_24h,
+            "bookTicker": book_ticker,
+            "premiumIndex": premium_index,
+            "openInterest": open_interest,
         },
         "metrics": metrics,
-
         "orderbook": depth,
         "orderbookHistory": {
-            "depthCommits": depth_commits,
+            "depthCommits": [],
             "polled": {
                 "seconds": hist_seconds if enable_poll_history else 0,
                 "stepSec": hist_step_sec if enable_poll_history else 0,
                 "levels": depth_levels,
                 "snapshots": depth_hist,
-            }
+            },
+            "note": "Binance REST does not provide a depth commits endpoint. Use websocket for granular deltas.",
         },
         "trades": trades,
-
         "klines": {
             "1m": k1,
             "5m": k5,
             "15m": k15,
         },
-
-        # ✅ LLM-friendly summary
-        "features": features
+        "features": features,
     }
 
     return bundle
@@ -581,12 +667,11 @@ def make_latest(symbol: str,
 
 if __name__ == "__main__":
     # Usage:
-    #   python collect_mexc_futures_latest.py BTC_USDT
-    #   python collect_mexc_futures_latest.py BTC_USDT 240 120 80 60
-    #
+    #   python collect_mexc_futures_latest.py BTCUSDT
+    #   python collect_mexc_futures_latest.py BTCUSDT 240 120 80 60
     # args:
     #   symbol bars_1m bars_5m bars_15m hist_seconds
-    symbol = sys.argv[1] if len(sys.argv) > 1 else "BTC_USDT"
+    symbol = _normalize_symbol(sys.argv[1]) if len(sys.argv) > 1 else "BTCUSDT"
     bars_1m = int(sys.argv[2]) if len(sys.argv) > 2 else 240
     bars_5m = int(sys.argv[3]) if len(sys.argv) > 3 else 120
     bars_15m = int(sys.argv[4]) if len(sys.argv) > 4 else 80
@@ -602,10 +687,10 @@ if __name__ == "__main__":
         depth_commits_n=60,
         hist_seconds=hist_seconds,
         hist_step_sec=2.0,
-        enable_poll_history=True
+        enable_poll_history=True,
     )
 
     with open("latest.json", "w", encoding="utf-8") as f:
         json.dump(bundle, f, ensure_ascii=False, separators=(",", ":"))
 
-    print("Saved latest.json (with features)")
+    print("Saved latest.json (BINANCE futures with features)")

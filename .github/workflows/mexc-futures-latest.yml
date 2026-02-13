@@ -1,12 +1,12 @@
-name: Collect MEXC Futures Latest JSON
+name: Collect Binance Futures Latest JSON
 
 on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: "MEXC futures symbol"
+        description: "Binance USD-M futures symbol"
         required: true
-        default: "BTC_USDT"
+        default: "BTCUSDT"
         type: string
       bars_1m:
         description: "1m bars"
@@ -33,7 +33,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: mexc-futures-latest-${{ github.ref }}
+  group: binance-futures-latest-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -93,7 +93,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mexc-latest-json
+          name: binance-latest-json
           path: latest-*.json
           if-no-files-found: error
           retention-days: 7
