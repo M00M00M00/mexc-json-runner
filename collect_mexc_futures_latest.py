@@ -157,7 +157,21 @@ def _get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
     raise last_err
 
 
-def _binance_get(path: str, params=None, timeout=10, retries=3, sleep=0.25):
+def _payload_matches_expect(data, expect) -> bool:
+    if expect is None:
+        return True
+    if callable(expect):
+        return bool(expect(data))
+    if isinstance(expect, str):
+        return isinstance(data, dict) and expect in data
+    if isinstance(expect, (list, tuple, set)):
+        return isinstance(data, dict) and all(k in data for k in expect)
+    if isinstance(expect, type):
+        return isinstance(data, expect)
+    raise ValueError(f"Unsupported expect spec: {expect!r}")
+
+
+def _binance_get(path: str, params=None, timeout=10, retries=3, sleep=0.25, expect=None):
     if not path.startswith("/"):
         path = "/" + path
 
@@ -168,11 +182,14 @@ def _binance_get(path: str, params=None, timeout=10, retries=3, sleep=0.25):
     for base in bases:
         url = f"{base}{path}"
         try:
-            return _get_json(url, params=params, timeout=timeout, retries=retries, sleep=sleep)
+            data = _get_json(url, params=params, timeout=timeout, retries=retries, sleep=sleep)
+            if not _payload_matches_expect(data, expect):
+                raise RuntimeError(f"Unexpected payload shape: {type(data).__name__} -> {str(data)[:220]}")
+            return data
         except Exception as e:
             msg = str(e)
             errors.append(f"{base}: {msg}")
-            if "HTTP 451" in msg:
+            if "HTTP 451" in msg or "restricted location" in msg.lower():
                 restricted_hits += 1
             continue
 
@@ -191,7 +208,7 @@ def _binance_get(path: str, params=None, timeout=10, retries=3, sleep=0.25):
 # Binance endpoints
 # ---------------------------
 def get_server_time_ms():
-    data = _binance_get("/fapi/v1/time")
+    data = _binance_get("/fapi/v1/time", expect="serverTime")
     return int(data["serverTime"])
 
 
@@ -201,6 +218,7 @@ def get_klines(symbol: str, interval: str, bars: int):
     data = _binance_get(
         "/fapi/v1/klines",
         params={"symbol": symbol, "interval": interval, "limit": bars},
+        expect=list,
     )
 
     out = []
@@ -222,17 +240,17 @@ def get_klines(symbol: str, interval: str, bars: int):
 
 def get_ticker_24h(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _binance_get("/fapi/v1/ticker/24hr", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/ticker/24hr", params={"symbol": symbol}, expect=["symbol", "lastPrice"])
 
 
 def get_book_ticker(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _binance_get("/fapi/v1/ticker/bookTicker", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/ticker/bookTicker", params={"symbol": symbol}, expect=["bidPrice", "askPrice"])
 
 
 def get_premium_index(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _binance_get("/fapi/v1/premiumIndex", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/premiumIndex", params={"symbol": symbol}, expect=["markPrice", "indexPrice"])
 
 
 def get_funding_history(symbol: str, n: int = 24):
@@ -241,6 +259,7 @@ def get_funding_history(symbol: str, n: int = 24):
     data = _binance_get(
         "/fapi/v1/fundingRate",
         params={"symbol": symbol, "limit": limit},
+        expect=list,
     )
     if not isinstance(data, list):
         return []
@@ -250,23 +269,23 @@ def get_funding_history(symbol: str, n: int = 24):
 
 def get_open_interest(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _binance_get("/fapi/v1/openInterest", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/openInterest", params={"symbol": symbol}, expect="openInterest")
 
 
 def get_exchange_info(symbol: str):
     symbol = _normalize_symbol(symbol)
-    return _binance_get("/fapi/v1/exchangeInfo", params={"symbol": symbol})
+    return _binance_get("/fapi/v1/exchangeInfo", params={"symbol": symbol}, expect="symbols")
 
 
 def get_depth(symbol: str, limit: int = 20):
     symbol = _normalize_symbol(symbol)
-    return _binance_get("/fapi/v1/depth", params={"symbol": symbol, "limit": _safe_depth_limit(limit)})
+    return _binance_get("/fapi/v1/depth", params={"symbol": symbol, "limit": _safe_depth_limit(limit)}, expect=["bids", "asks"])
 
 
 def get_trades(symbol: str, limit: int = 100):
     symbol = _normalize_symbol(symbol)
     n = max(1, min(1000, int(limit)))
-    return _binance_get("/fapi/v1/trades", params={"symbol": symbol, "limit": n})
+    return _binance_get("/fapi/v1/trades", params={"symbol": symbol, "limit": n}, expect=list)
 
 
 def _extract_symbol_info(exchange_info: Dict[str, Any], symbol: str) -> Dict[str, Any]:
