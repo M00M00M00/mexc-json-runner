@@ -17,7 +17,6 @@ DEFAULT_BINANCE_BASE_URLS = [
     "https://fapi2.binance.com",
     "https://fapi3.binance.com",
     "https://fapi4.binance.com",
-    "https://testnet.binancefuture.com",
 ]
 
 DEFAULT_HTTP_HEADERS = {
@@ -257,15 +256,11 @@ def get_premium_index(symbol: str):
 def get_funding_history(symbol: str, n: int = 24):
     symbol = _normalize_symbol(symbol)
     limit = max(1, min(1000, int(n)))
-    try:
-        data = _binance_get(
-            "/fapi/v1/fundingRate",
-            params={"symbol": symbol, "limit": limit},
-            expect=list,
-        )
-    except Exception:
-        # Some fallback endpoints (notably testnet) may not expose stable funding history.
-        return []
+    data = _binance_get(
+        "/fapi/v1/fundingRate",
+        params={"symbol": symbol, "limit": limit},
+        expect=list,
+    )
     if not isinstance(data, list):
         return []
     # Keep latest first for quick consumers.

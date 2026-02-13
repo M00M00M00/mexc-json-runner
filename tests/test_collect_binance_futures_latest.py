@@ -107,14 +107,8 @@ def test_binance_get_skips_unexpected_payload_shape(monkeypatch):
     ]
 
 
-def test_default_base_urls_include_testnet():
-    assert "https://testnet.binancefuture.com" in collector.DEFAULT_BINANCE_BASE_URLS
-
-
-def test_get_funding_history_returns_empty_when_endpoint_unavailable(monkeypatch):
-    monkeypatch.setattr(collector, "_binance_get", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("503")))
-    out = collector.get_funding_history("BTCUSDT", n=10)
-    assert out == []
+def test_default_base_urls_exclude_testnet():
+    assert "https://testnet.binancefuture.com" not in collector.DEFAULT_BINANCE_BASE_URLS
 
 
 def test_get_klines_transforms_binance_payload(monkeypatch):
