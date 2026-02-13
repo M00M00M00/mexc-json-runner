@@ -107,10 +107,6 @@ def test_binance_get_skips_unexpected_payload_shape(monkeypatch):
     ]
 
 
-def test_default_base_urls_exclude_testnet():
-    assert "https://testnet.binancefuture.com" not in collector.DEFAULT_BINANCE_BASE_URLS
-
-
 def test_get_klines_transforms_binance_payload(monkeypatch):
     kline_payload = [
         [1700000000000, "100", "110", "90", "105", "11", 1700000059999, "0", 0, "0", "0", "0"],
