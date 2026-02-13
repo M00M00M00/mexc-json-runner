@@ -31,7 +31,7 @@ on:
       binance_base_urls:
         description: "Comma-separated Binance API base URLs for fallback"
         required: true
-        default: "https://fapi.binance.com,https://fapi1.binance.com,https://fapi2.binance.com,https://fapi3.binance.com,https://fapi4.binance.com"
+        default: "https://fapi.binance.com,https://www.binance.com,https://fapi1.binance.com,https://fapi2.binance.com,https://fapi3.binance.com,https://fapi4.binance.com"
         type: string
 
 permissions:

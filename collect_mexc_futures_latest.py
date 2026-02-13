@@ -11,6 +11,7 @@ import requests
 # Priority can be overridden by env `BINANCE_BASE_URLS` (comma-separated) or `BINANCE_BASE_URL`.
 DEFAULT_BINANCE_BASE_URLS = [
     "https://fapi.binance.com",
+    "https://www.binance.com",
     "https://fapi1.binance.com",
     "https://fapi2.binance.com",
     "https://fapi3.binance.com",
