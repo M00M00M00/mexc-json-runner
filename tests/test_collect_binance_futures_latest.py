@@ -32,7 +32,7 @@ def test_interval_to_seconds_binance():
 def test_get_json_retries_then_succeeds(monkeypatch):
     calls = {"n": 0}
 
-    def fake_get(url, params=None, timeout=10):
+    def fake_get(url, params=None, timeout=10, headers=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return DummyResponse(500, {"code": -1}, text="internal")
@@ -42,6 +42,17 @@ def test_get_json_retries_then_succeeds(monkeypatch):
     out = collector._get_json("https://example.com", retries=2, sleep=0)
     assert out == {"ok": True}
     assert calls["n"] == 2
+
+
+def test_get_json_uses_curl_fallback_on_202(monkeypatch):
+    def fake_get(url, params=None, timeout=10, headers=None):
+        return DummyResponse(202, {"code": 0}, text="")
+
+    monkeypatch.setattr(collector.requests, "get", fake_get)
+    monkeypatch.setattr(collector, "_curl_get_json", lambda url, params=None, timeout=10: {"ok": True})
+
+    out = collector._get_json("https://example.com", retries=1, sleep=0)
+    assert out == {"ok": True}
 
 
 def test_binance_get_fallbacks_on_451(monkeypatch):

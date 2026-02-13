@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,6 +18,16 @@ DEFAULT_BINANCE_BASE_URLS = [
     "https://fapi3.binance.com",
     "https://fapi4.binance.com",
 ]
+
+DEFAULT_HTTP_HEADERS = {
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
 
 
 # ---------------------------
@@ -92,12 +103,50 @@ def _get_binance_base_urls() -> List[str]:
 # ---------------------------
 # HTTP helpers
 # ---------------------------
+def _curl_get_json(url, params=None, timeout=10):
+    cmd = [
+        "curl",
+        "-sS",
+        "-L",
+        "--max-time",
+        str(int(timeout)),
+        "-H",
+        "Accept: application/json,text/plain,*/*",
+        "-H",
+        f"User-Agent: {DEFAULT_HTTP_HEADERS['User-Agent']}",
+        "--get",
+        url,
+    ]
+    for k, v in (params or {}).items():
+        cmd.extend(["--data-urlencode", f"{k}={v}"])
+
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"curl failed rc={p.returncode}: {p.stderr.strip()[:180]}")
+
+    body = (p.stdout or "").strip()
+    if not body:
+        raise RuntimeError("curl returned empty body")
+    try:
+        return json.loads(body)
+    except Exception as e:
+        raise RuntimeError(f"curl returned non-JSON: {body[:180]}") from e
+
+
 def _get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
     last_err = None
     for _ in range(max(1, retries)):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HTTP_HEADERS)
             if r.status_code != 200:
+                # Some runners get Cloudflare/challenge style responses where curl may still work.
+                if r.status_code in (202, 403, 451):
+                    try:
+                        return _curl_get_json(url, params=params, timeout=timeout)
+                    except Exception as curl_err:
+                        last_err = RuntimeError(f"HTTP {r.status_code}: {r.text} | curl fallback failed: {curl_err}")
+                        time.sleep(sleep)
+                        continue
                 last_err = RuntimeError(f"HTTP {r.status_code}: {r.text}")
                 time.sleep(sleep)
                 continue
