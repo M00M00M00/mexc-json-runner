@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import time
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -493,12 +494,59 @@ def _snapshot_mid_price(bids: List[List[Any]], asks: List[List[Any]], fallback_p
     return best_bid if best_bid is not None else (best_ask if best_ask is not None else fallback_p)
 
 
+def _align_price_to_tick(price: float, tick_size: float, mode: str = "nearest"):
+    if price is None:
+        return None
+    tick = _to_float(tick_size)
+    if tick is None or tick <= 0:
+        return _to_float(price)
+
+    p = Decimal(str(price))
+    t = Decimal(str(tick))
+    q = p / t
+
+    if mode == "floor":
+        q_int = q.to_integral_value(rounding=ROUND_FLOOR)
+    elif mode == "ceil":
+        q_int = q.to_integral_value(rounding=ROUND_CEILING)
+    else:
+        q_int = q.to_integral_value(rounding=ROUND_HALF_UP)
+
+    return float(q_int * t)
+
+
+def build_tick_aligned_levels(entry_price: float, tick_size: float):
+    entry = _align_price_to_tick(entry_price, tick_size, mode="nearest")
+    if entry is None:
+        return {"available": False, "tickSize": tick_size}
+
+    long_stop_raw = entry * 0.99
+    long_take_raw = entry * 1.02
+    short_stop_raw = entry * 1.01
+    short_take_raw = entry * 0.98
+
+    return {
+        "available": True,
+        "tickSize": tick_size,
+        "long": {
+            "entry": entry,
+            "stop1pct": _align_price_to_tick(long_stop_raw, tick_size, mode="floor"),
+            "take2pct": _align_price_to_tick(long_take_raw, tick_size, mode="ceil"),
+        },
+        "short": {
+            "entry": entry,
+            "stop1pct": _align_price_to_tick(short_stop_raw, tick_size, mode="ceil"),
+            "take2pct": _align_price_to_tick(short_take_raw, tick_size, mode="floor"),
+        },
+    }
+
+
 def _trade_sort_key(tr: Dict[str, Any]) -> int:
-    for key in ("time", "T", "id"):
+    for key in ("time", "T", "t", "timestamp"):
         v = _to_float(tr.get(key))
         if v is not None:
             return int(v)
-    return -1
+    return 0
 
 
 def _latest_trades_window(trades: List[Dict[str, Any]], n: int = 40) -> List[Dict[str, Any]]:
@@ -551,6 +599,7 @@ def compute_depth_history_features(
     tick_size: float = None,
     tick_tolerance_ticks: int = 2,
     band_pct: float = 0.0015,
+    min_samples: int = 6,
 ):
     if not depth_snapshots:
         return {"available": False}
@@ -569,7 +618,7 @@ def compute_depth_history_features(
     def _persistence(wall_key: str):
         prices = [w[wall_key]["price"] for w in walls if w.get(wall_key, {}).get("price") is not None]
         sizes = [w[wall_key]["size"] for w in walls if w.get(wall_key, {}).get("size") is not None]
-        if len(prices) < 3:
+        if len(prices) < max(1, int(min_samples)):
             return {"samples": len(prices), "persistRate": None, "churnRate": None, "sizeCv": None}
 
         same = 0
@@ -593,13 +642,20 @@ def compute_depth_history_features(
 
         return {"samples": len(prices), "persistRate": persist_rate, "churnRate": churn_rate, "sizeCv": cv}
 
+    bid_stats = _persistence("bidWall")
+    ask_stats = _persistence("askWall")
+
     return {
         "available": True,
         "tickSizeUsed": tick_size,
         "tickToleranceTicks": tick_tolerance_ticks,
         "bandPct": band_pct,
-        "bidWall": _persistence("bidWall"),
-        "askWall": _persistence("askWall"),
+        "minSamplesForPersist": min_samples,
+        "bidWall": bid_stats,
+        "askWall": ask_stats,
+        # Compatibility aliases for downstream prompts expecting top* keys.
+        "topBidWall": dict(bid_stats),
+        "topAskWall": dict(ask_stats),
     }
 
 
@@ -798,11 +854,13 @@ def make_latest(
             tick_size=tick_size,
             tick_tolerance_ticks=2,
             band_pct=0.0015,
+            min_samples=6,
         )
         if p
         else {"available": False}
     )
     tr_feat = compute_trade_features(_latest_trades_window(trades, n=40))
+    rr_levels = build_tick_aligned_levels(p, tick_size)
     oi_feat = compute_oi_features(ticker_hist)
     ctx_feat = compute_context_features(k15, k5)
 
@@ -813,6 +871,7 @@ def make_latest(
         "trades": tr_feat,
         "openInterest": oi_feat,
         "context": ctx_feat,
+        "riskLevels": rr_levels,
     }
 
     bundle = {
@@ -848,6 +907,7 @@ def make_latest(
             "5m": k5,
             "15m": k15,
         },
+        "riskLevels": rr_levels,
         "features": features,
     }
 

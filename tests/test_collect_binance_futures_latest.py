@@ -157,6 +157,20 @@ def test_latest_trades_window_sorts_by_time_desc():
     assert [x["time"] for x in out] == [1700000003000, 1700000002000]
 
 
+def test_trade_sort_key_priority_time_T_t_timestamp():
+    trades = [
+        {"timestamp": 10, "price": "1", "qty": "1"},
+        {"t": 11, "price": "1", "qty": "1"},
+        {"T": 12, "price": "1", "qty": "1"},
+        {"time": 13, "price": "1", "qty": "1"},
+    ]
+    out = collector._latest_trades_window(trades, n=4)
+    assert out[0].get("time") == 13
+    assert out[1].get("T") == 12
+    assert out[2].get("t") == 11
+    assert out[3].get("timestamp") == 10
+
+
 def test_depth_history_features_uses_tick_tolerance_and_snapshot_mid():
     snaps = [
         {
@@ -183,6 +197,7 @@ def test_depth_history_features_uses_tick_tolerance_and_snapshot_mid():
         tick_size=0.1,
         tick_tolerance_ticks=2,
         band_pct=0.002,
+        min_samples=3,
     )
 
     assert out["available"] is True
@@ -192,6 +207,31 @@ def test_depth_history_features_uses_tick_tolerance_and_snapshot_mid():
     assert out["askWall"]["persistRate"] == 1.0
     assert out["tickSizeUsed"] == 0.1
     assert out["tickToleranceTicks"] == 2
+    assert out["topBidWall"]["persistRate"] == out["bidWall"]["persistRate"]
+    assert out["topAskWall"]["persistRate"] == out["askWall"]["persistRate"]
+
+
+def test_depth_history_features_sets_persist_none_when_samples_lt_6():
+    snaps = [
+        {"timestamp": 1, "bids": [["100.0", "10"]], "asks": [["100.1", "10"]]},
+        {"timestamp": 2, "bids": [["100.1", "10"]], "asks": [["100.2", "10"]]},
+        {"timestamp": 3, "bids": [["100.2", "10"]], "asks": [["100.3", "10"]]},
+        {"timestamp": 4, "bids": [["100.3", "10"]], "asks": [["100.4", "10"]]},
+        {"timestamp": 5, "bids": [["100.4", "10"]], "asks": [["100.5", "10"]]},
+    ]
+    out = collector.compute_depth_history_features(
+        snaps,
+        p=100.0,
+        levels=1,
+        tick_size=0.1,
+        tick_tolerance_ticks=2,
+        band_pct=0.002,
+        min_samples=6,
+    )
+    assert out["bidWall"]["samples"] == 5
+    assert out["bidWall"]["persistRate"] is None
+    assert out["askWall"]["persistRate"] is None
+    assert out["topBidWall"]["persistRate"] is None
 
 
 def test_extract_symbol_info_and_market_info():
@@ -259,7 +299,7 @@ def test_make_latest_builds_binance_bundle(monkeypatch):
     monkeypatch.setattr(
         collector,
         "get_ticker_24h",
-        lambda s: {"symbol": "BTCUSDT", "lastPrice": "100", "volume": "10", "quoteVolume": "1000", "closeTime": 1700000000000},
+        lambda s: {"symbol": "BTCUSDT", "lastPrice": "100.06", "volume": "10", "quoteVolume": "1000", "closeTime": 1700000000000},
     )
     monkeypatch.setattr(collector, "get_book_ticker", lambda s: {"symbol": "BTCUSDT", "bidPrice": "99.9", "askPrice": "100.1"})
     monkeypatch.setattr(
@@ -340,12 +380,18 @@ def test_make_latest_builds_binance_bundle(monkeypatch):
 
     assert bundle["meta"]["exchange"] == "BINANCE"
     assert bundle["meta"]["symbol"] == "BTCUSDT"
-    assert bundle["price"]["ticker"]["lastPrice"] == 100.0
+    assert bundle["price"]["ticker"]["lastPrice"] == 100.06
     assert bundle["price"]["premiumIndex"]["markPrice"] == "100.2"
     assert bundle["marketInfo"]["tickSize"] == 0.1
     assert bundle["metrics"]["fundingRateNow"] == 0.0001
     assert bundle["orderbook"]["bids"][0][0] == "99.9"
     assert "orderbook" in bundle["features"]
+    assert bundle["riskLevels"]["available"] is True
+    assert bundle["riskLevels"]["long"]["entry"] == 100.1
+    assert bundle["riskLevels"]["long"]["stop1pct"] == 99.0
+    assert bundle["riskLevels"]["long"]["take2pct"] == 102.2
+    assert bundle["riskLevels"]["short"]["stop1pct"] == 101.2
+    assert bundle["riskLevels"]["short"]["take2pct"] == 98.0
 
 
 def test_iso_from_ms_utc():
