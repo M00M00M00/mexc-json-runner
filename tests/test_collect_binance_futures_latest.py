@@ -398,3 +398,21 @@ def test_iso_from_ms_utc():
     ts = collector._iso_from_ms(1700000000000)
     parsed = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
     assert int(parsed.timestamp()) == 1700000000
+
+
+def test_risk_levels_are_tick_aligned():
+    out = collector.build_tick_aligned_levels(entry_price=68870.93, tick_size=0.1)
+    assert out["available"] is True
+
+    tick = 0.1
+    vals = [
+        out["long"]["entry"],
+        out["long"]["stop1pct"],
+        out["long"]["take2pct"],
+        out["short"]["entry"],
+        out["short"]["stop1pct"],
+        out["short"]["take2pct"],
+    ]
+    for v in vals:
+        units = round(v / tick)
+        assert abs(v - units * tick) < 1e-9
