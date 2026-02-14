@@ -5,6 +5,24 @@ import pytest
 import collect_mexc_futures_latest as collector
 
 
+def _is_tick_aligned(value, tick, eps=1e-9):
+    units = round(value / tick)
+    return abs(value - units * tick) < eps
+
+
+def _build_linear_klines(n, start=100.0, step=0.1):
+    rows = []
+    px = start
+    for i in range(n):
+        o = px
+        c = px + step
+        h = max(o, c) + 0.2
+        l = min(o, c) - 0.2
+        rows.append({"ts": f"2024-01-01T00:{i:02d}:00Z", "o": o, "h": h, "l": l, "c": c, "v": 10.0 + i})
+        px = c
+    return rows
+
+
 class DummyResponse:
     def __init__(self, status_code, payload, text=""):
         self.status_code = status_code
@@ -392,6 +410,9 @@ def test_make_latest_builds_binance_bundle(monkeypatch):
     assert bundle["riskLevels"]["long"]["take2pct"] == 102.2
     assert bundle["riskLevels"]["short"]["stop1pct"] == 101.2
     assert bundle["riskLevels"]["short"]["take2pct"] == 98.0
+    assert "levelCandidates" in bundle["features"]
+    assert "volatility" in bundle["features"]
+    assert "microTrend" in bundle["features"]
 
 
 def test_iso_from_ms_utc():
@@ -416,3 +437,97 @@ def test_risk_levels_are_tick_aligned():
     for v in vals:
         units = round(v / tick)
         assert abs(v - units * tick) < 1e-9
+
+
+def _sample_level_candidates():
+    k5 = [
+        {"ts": "2024-01-01T00:00:00Z", "o": 99.8, "h": 100.1, "l": 99.4, "c": 99.7, "v": 10},
+        {"ts": "2024-01-01T00:05:00Z", "o": 99.7, "h": 100.0, "l": 99.3, "c": 99.8, "v": 11},
+        {"ts": "2024-01-01T00:10:00Z", "o": 99.8, "h": 100.2, "l": 99.5, "c": 100.0, "v": 12},
+        {"ts": "2024-01-01T00:15:00Z", "o": 100.0, "h": 100.6, "l": 99.8, "c": 100.4, "v": 13},
+        {"ts": "2024-01-01T00:20:00Z", "o": 100.4, "h": 100.7, "l": 100.0, "c": 100.3, "v": 14},
+        {"ts": "2024-01-01T00:25:00Z", "o": 100.3, "h": 100.8, "l": 100.1, "c": 100.6, "v": 15},
+    ]
+    return collector.compute_level_candidates(
+        p=100.0,
+        bid=99.9,
+        ask=100.1,
+        tick_size=0.1,
+        orderbook_feat={
+            "nearBand": {
+                "topBidWall": {"price": 99.6, "size": 120.0},
+                "topAskWall": {"price": 100.4, "size": 130.0},
+            }
+        },
+        context_feat={"range15m": {"lo": 98.0, "hi": 102.0}},
+        klines_5m=k5,
+    )
+
+
+def test_level_candidates_exist_and_have_required_fields():
+    out = _sample_level_candidates()
+    assert out["available"] is True
+    assert out["long"]
+    assert out["short"]
+
+    required = {"name", "entry", "stop1pct", "take2pct", "withinP08", "entryMakerSafe"}
+    for side in ("long", "short"):
+        for item in out[side]:
+            assert required.issubset(item.keys())
+
+
+def test_level_candidates_tick_alignment_and_stop_take_rounding():
+    out = _sample_level_candidates()
+    tick = out["tickSize"]
+    assert tick == 0.1
+
+    for side in ("long", "short"):
+        for item in out[side]:
+            assert _is_tick_aligned(item["entry"], tick)
+            assert _is_tick_aligned(item["stop1pct"], tick)
+            assert _is_tick_aligned(item["take2pct"], tick)
+
+            if side == "long":
+                raw_stop = item["entry"] * 0.99
+                raw_take = item["entry"] * 1.02
+                assert item["stop1pct"] <= raw_stop + 1e-9
+                assert raw_stop - item["stop1pct"] < tick + 1e-9
+                assert item["take2pct"] >= raw_take - 1e-9
+                assert item["take2pct"] - raw_take < tick + 1e-9
+            else:
+                raw_stop = item["entry"] * 1.01
+                raw_take = item["entry"] * 0.98
+                assert item["stop1pct"] >= raw_stop - 1e-9
+                assert item["stop1pct"] - raw_stop < tick + 1e-9
+                assert item["take2pct"] <= raw_take + 1e-9
+                assert raw_take - item["take2pct"] < tick + 1e-9
+
+
+def test_level_candidates_enforce_maker_safe_entries():
+    out = _sample_level_candidates()
+    tick = out["tickSize"]
+    bid = out["bid"]
+    ask = out["ask"]
+
+    for item in out["long"]:
+        assert item["entryMakerSafe"] is True
+        assert item["entry"] <= ask - tick + 1e-9
+
+    for item in out["short"]:
+        assert item["entryMakerSafe"] is True
+        assert item["entry"] >= bid + tick - 1e-9
+
+
+def test_volatility_and_micro_trend_features_payload():
+    k1 = _build_linear_klines(60, start=100.0, step=0.08)
+    k5 = _build_linear_klines(60, start=100.0, step=0.25)
+
+    vol = collector.compute_volatility_features(k1, k5, p=104.8)
+    assert vol["available"] is True
+    assert isinstance(vol["atr1m"], float)
+    assert isinstance(vol["atr5m"], float)
+    assert isinstance(vol["atr1mPct"], float)
+    assert isinstance(vol["atr5mPct"], float)
+
+    micro = collector.compute_micro_trend_features(k1, lookback=60)
+    assert micro["trend"] in {"UP", "DOWN", "RANGE", None}

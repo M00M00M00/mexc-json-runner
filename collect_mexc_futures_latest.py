@@ -494,15 +494,15 @@ def _snapshot_mid_price(bids: List[List[Any]], asks: List[List[Any]], fallback_p
     return best_bid if best_bid is not None else (best_ask if best_ask is not None else fallback_p)
 
 
-def _align_price_to_tick(price: float, tick_size: float, mode: str = "nearest"):
-    if price is None:
+def quantize_price(px: float, tick: float, mode: str = "round"):
+    if px is None:
         return None
-    tick = _to_float(tick_size)
-    if tick is None or tick <= 0:
-        return _to_float(price)
+    tick_f = _to_float(tick)
+    if tick_f is None or tick_f <= 0:
+        return _to_float(px)
 
-    p = Decimal(str(price))
-    t = Decimal(str(tick))
+    p = Decimal(str(px))
+    t = Decimal(str(tick_f))
     q = p / t
 
     if mode == "floor":
@@ -513,6 +513,11 @@ def _align_price_to_tick(price: float, tick_size: float, mode: str = "nearest"):
         q_int = q.to_integral_value(rounding=ROUND_HALF_UP)
 
     return float(q_int * t)
+
+
+def _align_price_to_tick(price: float, tick_size: float, mode: str = "nearest"):
+    normalized_mode = "round" if mode in ("nearest", "round") else mode
+    return quantize_price(price, tick_size, normalized_mode)
 
 
 def build_tick_aligned_levels(entry_price: float, tick_size: float):
@@ -538,6 +543,259 @@ def build_tick_aligned_levels(entry_price: float, tick_size: float):
             "stop1pct": _align_price_to_tick(short_stop_raw, tick_size, mode="ceil"),
             "take2pct": _align_price_to_tick(short_take_raw, tick_size, mode="floor"),
         },
+    }
+
+
+def _valid_ohlc_rows(klines: List[Dict[str, Any]], lookback: int) -> List[Dict[str, float]]:
+    rows = []
+    tail = (klines or [])[-max(1, int(lookback)) :]
+    for row in tail:
+        h = _to_float(row.get("h"))
+        l = _to_float(row.get("l"))
+        c = _to_float(row.get("c"))
+        if h is None or l is None or c is None:
+            continue
+        rows.append({"h": h, "l": l, "c": c})
+    return rows
+
+
+def _pivot_high_low_values(rows: List[Dict[str, float]], span: int = 2) -> Tuple[List[float], List[float]]:
+    lows = []
+    highs = []
+    n = len(rows)
+    span = max(1, int(span))
+    if n < (span * 2 + 1):
+        return lows, highs
+
+    for i in range(span, n - span):
+        low_window = [rows[j]["l"] for j in range(i - span, i + span + 1)]
+        high_window = [rows[j]["h"] for j in range(i - span, i + span + 1)]
+        cur_low = rows[i]["l"]
+        cur_high = rows[i]["h"]
+
+        if cur_low <= min(low_window):
+            lows.append(cur_low)
+        if cur_high >= max(high_window):
+            highs.append(cur_high)
+
+    return lows, highs
+
+
+def _latest_swing_levels_5m(klines_5m: List[Dict[str, Any]], lookback: int = 60) -> Tuple[float, float]:
+    rows = _valid_ohlc_rows(klines_5m, lookback=lookback)
+    pivot_lows, pivot_highs = _pivot_high_low_values(rows, span=2)
+
+    recent_rows = rows[-20:]
+    fallback_low = min((x["l"] for x in recent_rows), default=None)
+    fallback_high = max((x["h"] for x in recent_rows), default=None)
+
+    swing_low = pivot_lows[-1] if pivot_lows else fallback_low
+    swing_high = pivot_highs[-1] if pivot_highs else fallback_high
+    return swing_low, swing_high
+
+
+def _atr_from_klines(klines: List[Dict[str, Any]], period: int = 14, lookback: int = 60):
+    period = max(1, int(period))
+    rows = _valid_ohlc_rows(klines, lookback=lookback)
+    if len(rows) < period:
+        return None
+
+    tr_values = []
+    prev_close = None
+    for row in rows:
+        h = row["h"]
+        l = row["l"]
+        c = row["c"]
+        if prev_close is None:
+            tr = h - l
+        else:
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        tr_values.append(tr)
+        prev_close = c
+
+    if len(tr_values) < period:
+        return None
+
+    atr = sum(tr_values[:period]) / period
+    for tr in tr_values[period:]:
+        atr = ((atr * (period - 1)) + tr) / period
+    return atr
+
+
+def compute_volatility_features(klines_1m: List[Dict[str, Any]], klines_5m: List[Dict[str, Any]], p: float):
+    atr1m = _atr_from_klines(klines_1m, period=14, lookback=60)
+    atr5m = _atr_from_klines(klines_5m, period=14, lookback=60)
+
+    atr1m_pct = (atr1m / p * 100.0) if (atr1m is not None and p not in (None, 0)) else None
+    atr5m_pct = (atr5m / p * 100.0) if (atr5m is not None and p not in (None, 0)) else None
+
+    return {
+        "available": atr1m is not None or atr5m is not None,
+        "atr1m": atr1m,
+        "atr1mPct": atr1m_pct,
+        "atr5m": atr5m,
+        "atr5mPct": atr5m_pct,
+    }
+
+
+def compute_micro_trend_features(klines_1m: List[Dict[str, Any]], lookback: int = 60):
+    rows = _valid_ohlc_rows(klines_1m, lookback=lookback)
+    swing_lows, swing_highs = _pivot_high_low_values(rows, span=2)
+
+    trend = None
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        has_higher_high = swing_highs[-1] > swing_highs[-2]
+        has_higher_low = swing_lows[-1] > swing_lows[-2]
+        has_lower_high = swing_highs[-1] < swing_highs[-2]
+        has_lower_low = swing_lows[-1] < swing_lows[-2]
+
+        if has_higher_high and has_higher_low:
+            trend = "UP"
+        elif has_lower_high and has_lower_low:
+            trend = "DOWN"
+        else:
+            trend = "RANGE"
+    elif len(rows) >= 5:
+        trend = "RANGE"
+
+    return {
+        "available": len(rows) >= 5,
+        "lookback": lookback,
+        "trend": trend,
+        "lastSwingHigh": swing_highs[-1] if swing_highs else None,
+        "lastSwingLow": swing_lows[-1] if swing_lows else None,
+    }
+
+
+def _entry_maker_safe(side: str, entry: float, bid: float, ask: float, tick_size: float) -> bool:
+    if entry is None:
+        return False
+
+    tick = _to_float(tick_size)
+    if side == "long":
+        if ask is None:
+            return False
+        if tick is not None and tick > 0:
+            return entry <= (ask - tick + 1e-12)
+        return entry < ask
+
+    if bid is None:
+        return False
+    if tick is not None and tick > 0:
+        return entry >= (bid + tick - 1e-12)
+    return entry > bid
+
+
+def _candidate_risk_levels(side: str, entry: float, tick_size: float) -> Tuple[float, float]:
+    if entry is None:
+        return None, None
+    if side == "long":
+        stop = quantize_price(entry * 0.99, tick_size, mode="floor")
+        take = quantize_price(entry * 1.02, tick_size, mode="ceil")
+    else:
+        stop = quantize_price(entry * 1.01, tick_size, mode="ceil")
+        take = quantize_price(entry * 0.98, tick_size, mode="floor")
+    return stop, take
+
+
+def _build_level_candidate(
+    name: str,
+    side: str,
+    entry: float,
+    p: float,
+    bid: float,
+    ask: float,
+    tick_size: float,
+) -> Dict[str, Any]:
+    if entry is None:
+        return {}
+
+    within_p08 = False
+    if p not in (None, 0):
+        within_p08 = abs(entry - p) / p <= 0.008
+
+    stop, take = _candidate_risk_levels(side, entry, tick_size)
+    return {
+        "name": name,
+        "entry": entry,
+        "entryMakerSafe": _entry_maker_safe(side, entry, bid, ask, tick_size),
+        "withinP08": within_p08,
+        "stop1pct": stop,
+        "take2pct": take,
+    }
+
+
+def compute_level_candidates(
+    p: float,
+    bid: float,
+    ask: float,
+    tick_size: float,
+    orderbook_feat: Dict[str, Any],
+    context_feat: Dict[str, Any],
+    klines_5m: List[Dict[str, Any]],
+):
+    tick = _to_float(tick_size)
+    near_band = (orderbook_feat or {}).get("nearBand", {}) if isinstance(orderbook_feat, dict) else {}
+    range15 = (context_feat or {}).get("range15m", {}) if isinstance(context_feat, dict) else {}
+
+    top_bid_wall_px = _to_float((near_band.get("topBidWall") or {}).get("price")) if isinstance(near_band, dict) else None
+    top_ask_wall_px = _to_float((near_band.get("topAskWall") or {}).get("price")) if isinstance(near_band, dict) else None
+    range_lo = _to_float(range15.get("lo")) if isinstance(range15, dict) else None
+    range_hi = _to_float(range15.get("hi")) if isinstance(range15, dict) else None
+
+    swing_low, swing_high = _latest_swing_levels_5m(klines_5m, lookback=60)
+
+    long_candidates = []
+    short_candidates = []
+
+    if top_bid_wall_px is not None:
+        raw = top_bid_wall_px + (tick if tick is not None and tick > 0 else 0.0)
+        entry = quantize_price(raw, tick, mode="round")
+        cand = _build_level_candidate("nearBand.topBidWall+1tick", "long", entry, p, bid, ask, tick)
+        if cand:
+            long_candidates.append(cand)
+
+    if swing_low is not None:
+        entry = quantize_price(swing_low, tick, mode="floor")
+        cand = _build_level_candidate("swingLow5m", "long", entry, p, bid, ask, tick)
+        if cand:
+            long_candidates.append(cand)
+
+    if range_lo is not None:
+        raw = range_lo * 1.002
+        entry = quantize_price(raw, tick, mode="floor")
+        cand = _build_level_candidate("range15m_lo+0.2%", "long", entry, p, bid, ask, tick)
+        if cand:
+            long_candidates.append(cand)
+
+    if top_ask_wall_px is not None:
+        raw = top_ask_wall_px - (tick if tick is not None and tick > 0 else 0.0)
+        entry = quantize_price(raw, tick, mode="round")
+        cand = _build_level_candidate("nearBand.topAskWall-1tick", "short", entry, p, bid, ask, tick)
+        if cand:
+            short_candidates.append(cand)
+
+    if swing_high is not None:
+        entry = quantize_price(swing_high, tick, mode="ceil")
+        cand = _build_level_candidate("swingHigh5m", "short", entry, p, bid, ask, tick)
+        if cand:
+            short_candidates.append(cand)
+
+    if range_hi is not None:
+        raw = range_hi * 0.998
+        entry = quantize_price(raw, tick, mode="ceil")
+        cand = _build_level_candidate("range15m_hi-0.2%", "short", entry, p, bid, ask, tick)
+        if cand:
+            short_candidates.append(cand)
+
+    return {
+        "available": bool(long_candidates or short_candidates),
+        "tickSize": tick,
+        "P": p,
+        "bid": bid,
+        "ask": ask,
+        "long": long_candidates,
+        "short": short_candidates,
     }
 
 
@@ -843,8 +1101,15 @@ def make_latest(
     p = ticker.get("lastPrice") or ticker.get("fairPrice") or ticker.get("indexPrice")
     if p is None and k1:
         p = _to_float(k1[-1].get("c"))
+    bid = ticker.get("bid1") or _to_float(book_ticker.get("bidPrice"))
+    ask = ticker.get("ask1") or _to_float(book_ticker.get("askPrice"))
 
     ob_feat = compute_orderbook_features(depth, p, band_pct=0.0015, topN=depth_levels) if p else {"available": False}
+    if bid is None and isinstance(ob_feat, dict):
+        bid = _to_float(ob_feat.get("bestBid"))
+    if ask is None and isinstance(ob_feat, dict):
+        ask = _to_float(ob_feat.get("bestAsk"))
+
     tick_size = _to_float(market_info.get("tickSize")) or _to_float(market_info.get("priceUnit"))
     ob_hist_feat = (
         compute_depth_history_features(
@@ -863,6 +1128,17 @@ def make_latest(
     rr_levels = build_tick_aligned_levels(p, tick_size)
     oi_feat = compute_oi_features(ticker_hist)
     ctx_feat = compute_context_features(k15, k5)
+    vol_feat = compute_volatility_features(k1, k5, p)
+    micro_trend_feat = compute_micro_trend_features(k1, lookback=60)
+    level_candidates = compute_level_candidates(
+        p=p,
+        bid=bid,
+        ask=ask,
+        tick_size=tick_size,
+        orderbook_feat=ob_feat,
+        context_feat=ctx_feat,
+        klines_5m=k5,
+    )
 
     features = {
         "P_used": p,
@@ -872,6 +1148,9 @@ def make_latest(
         "openInterest": oi_feat,
         "context": ctx_feat,
         "riskLevels": rr_levels,
+        "levelCandidates": level_candidates,
+        "volatility": vol_feat,
+        "microTrend": micro_trend_feat,
     }
 
     bundle = {
