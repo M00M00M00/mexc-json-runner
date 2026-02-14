@@ -29,6 +29,8 @@ DEFAULT_HTTP_HEADERS = {
     ),
 }
 
+_HTTP_SESSION = requests.Session()
+
 
 # ---------------------------
 # Generic helpers
@@ -103,6 +105,10 @@ def _get_binance_base_urls() -> List[str]:
 # ---------------------------
 # HTTP helpers
 # ---------------------------
+def _http_get(url, params=None, timeout=10, headers=None):
+    return _HTTP_SESSION.get(url, params=params, timeout=timeout, headers=headers)
+
+
 def _curl_get_json(url, params=None, timeout=10):
     cmd = [
         "curl",
@@ -137,7 +143,7 @@ def _get_json(url, params=None, timeout=10, retries=3, sleep=0.25):
     last_err = None
     for _ in range(max(1, retries)):
         try:
-            r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HTTP_HEADERS)
+            r = _http_get(url, params=params, timeout=timeout, headers=DEFAULT_HTTP_HEADERS)
             if r.status_code != 200:
                 # Some runners get Cloudflare/challenge style responses where curl may still work.
                 if r.status_code in (202, 403, 451):
@@ -469,6 +475,38 @@ def _top_wall(levels: List[List[Any]]) -> Dict[str, Any]:
     return best
 
 
+def _price_within_tick_tolerance(prev_px: float, cur_px: float, tick_size: float, tick_tolerance_ticks: int) -> bool:
+    if prev_px is None or cur_px is None:
+        return False
+    if tick_size is not None and tick_size > 0:
+        tol = tick_size * max(0, int(tick_tolerance_ticks))
+    else:
+        tol = 1e-9
+    return abs(cur_px - prev_px) <= (tol + 1e-12)
+
+
+def _snapshot_mid_price(bids: List[List[Any]], asks: List[List[Any]], fallback_p: float):
+    best_bid = _to_float(bids[0][0]) if bids and isinstance(bids[0], list) and len(bids[0]) >= 2 else None
+    best_ask = _to_float(asks[0][0]) if asks and isinstance(asks[0], list) and len(asks[0]) >= 2 else None
+    if best_bid is not None and best_ask is not None:
+        return (best_bid + best_ask) / 2.0
+    return best_bid if best_bid is not None else (best_ask if best_ask is not None else fallback_p)
+
+
+def _trade_sort_key(tr: Dict[str, Any]) -> int:
+    for key in ("time", "T", "id"):
+        v = _to_float(tr.get(key))
+        if v is not None:
+            return int(v)
+    return -1
+
+
+def _latest_trades_window(trades: List[Dict[str, Any]], n: int = 40) -> List[Dict[str, Any]]:
+    if not trades:
+        return []
+    return sorted(trades, key=_trade_sort_key, reverse=True)[: max(1, int(n))]
+
+
 def compute_orderbook_features(orderbook: Dict[str, Any], p: float, band_pct: float = 0.0015, topN: int = 20):
     bids = (orderbook.get("bids", []) or [])[:topN]
     asks = (orderbook.get("asks", []) or [])[:topN]
@@ -506,7 +544,14 @@ def compute_orderbook_features(orderbook: Dict[str, Any], p: float, band_pct: fl
     }
 
 
-def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: float, levels: int = 20):
+def compute_depth_history_features(
+    depth_snapshots: List[Dict[str, Any]],
+    p: float,
+    levels: int = 20,
+    tick_size: float = None,
+    tick_tolerance_ticks: int = 2,
+    band_pct: float = 0.0015,
+):
     if not depth_snapshots:
         return {"available": False}
 
@@ -514,11 +559,12 @@ def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: flo
     for snap in depth_snapshots:
         bids = (snap.get("bids", []) or [])[:levels]
         asks = (snap.get("asks", []) or [])[:levels]
-        near_bids = _near_band_levels(bids, p, 0.0015, "bids")
-        near_asks = _near_band_levels(asks, p, 0.0015, "asks")
+        snap_mid = _snapshot_mid_price(bids, asks, p)
+        near_bids = _near_band_levels(bids, snap_mid, band_pct, "bids")
+        near_asks = _near_band_levels(asks, snap_mid, band_pct, "asks")
         bw = _top_wall(near_bids) if near_bids else {"price": None, "size": None}
         aw = _top_wall(near_asks) if near_asks else {"price": None, "size": None}
-        walls.append({"t": snap.get("timestamp"), "bidWall": bw, "askWall": aw})
+        walls.append({"t": snap.get("timestamp"), "midPrice": snap_mid, "bidWall": bw, "askWall": aw})
 
     def _persistence(wall_key: str):
         prices = [w[wall_key]["price"] for w in walls if w.get(wall_key, {}).get("price") is not None]
@@ -529,7 +575,7 @@ def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: flo
         same = 0
         changes = 0
         for i in range(1, len(prices)):
-            if prices[i] == prices[i - 1]:
+            if _price_within_tick_tolerance(prices[i - 1], prices[i], tick_size, tick_tolerance_ticks):
                 same += 1
             else:
                 changes += 1
@@ -549,6 +595,9 @@ def compute_depth_history_features(depth_snapshots: List[Dict[str, Any]], p: flo
 
     return {
         "available": True,
+        "tickSizeUsed": tick_size,
+        "tickToleranceTicks": tick_tolerance_ticks,
+        "bandPct": band_pct,
         "bidWall": _persistence("bidWall"),
         "askWall": _persistence("askWall"),
     }
@@ -694,7 +743,7 @@ def make_latest(
     trades_n: int = 100,
     depth_commits_n: int = 60,  # kept for API compatibility, unused on Binance REST
     hist_seconds: int = 60,
-    hist_step_sec: float = 2.0,
+    hist_step_sec: float = 3.0,
     enable_poll_history: bool = True,
 ):
     del depth_commits_n
@@ -740,8 +789,20 @@ def make_latest(
         p = _to_float(k1[-1].get("c"))
 
     ob_feat = compute_orderbook_features(depth, p, band_pct=0.0015, topN=depth_levels) if p else {"available": False}
-    ob_hist_feat = compute_depth_history_features(depth_hist, p, levels=depth_levels) if p else {"available": False}
-    tr_feat = compute_trade_features(trades[:40])
+    tick_size = _to_float(market_info.get("tickSize")) or _to_float(market_info.get("priceUnit"))
+    ob_hist_feat = (
+        compute_depth_history_features(
+            depth_hist,
+            p,
+            levels=depth_levels,
+            tick_size=tick_size,
+            tick_tolerance_ticks=2,
+            band_pct=0.0015,
+        )
+        if p
+        else {"available": False}
+    )
+    tr_feat = compute_trade_features(_latest_trades_window(trades, n=40))
     oi_feat = compute_oi_features(ticker_hist)
     ctx_feat = compute_context_features(k15, k5)
 
@@ -814,7 +875,7 @@ if __name__ == "__main__":
         trades_n=100,
         depth_commits_n=60,
         hist_seconds=hist_seconds,
-        hist_step_sec=2.0,
+        hist_step_sec=3.0,
         enable_poll_history=True,
     )
 

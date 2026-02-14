@@ -38,7 +38,7 @@ def test_get_json_retries_then_succeeds(monkeypatch):
             return DummyResponse(500, {"code": -1}, text="internal")
         return DummyResponse(200, {"ok": True})
 
-    monkeypatch.setattr(collector.requests, "get", fake_get)
+    monkeypatch.setattr(collector, "_http_get", fake_get)
     out = collector._get_json("https://example.com", retries=2, sleep=0)
     assert out == {"ok": True}
     assert calls["n"] == 2
@@ -48,7 +48,7 @@ def test_get_json_uses_curl_fallback_on_202(monkeypatch):
     def fake_get(url, params=None, timeout=10, headers=None):
         return DummyResponse(202, {"code": 0}, text="")
 
-    monkeypatch.setattr(collector.requests, "get", fake_get)
+    monkeypatch.setattr(collector, "_http_get", fake_get)
     monkeypatch.setattr(collector, "_curl_get_json", lambda url, params=None, timeout=10: {"ok": True})
 
     out = collector._get_json("https://example.com", retries=1, sleep=0)
@@ -145,6 +145,53 @@ def test_compute_trade_features_uses_binance_aggressor_side():
     assert out["sellCnt"] == 1
     assert out["maxTrade"]["vol"] == 5.0
     assert out["maxTrade"]["aggressorSide"] == "BUY"
+
+
+def test_latest_trades_window_sorts_by_time_desc():
+    trades = [
+        {"time": 1700000001000, "price": "100.0", "qty": "1"},
+        {"time": 1700000003000, "price": "101.0", "qty": "1"},
+        {"time": 1700000002000, "price": "102.0", "qty": "1"},
+    ]
+    out = collector._latest_trades_window(trades, n=2)
+    assert [x["time"] for x in out] == [1700000003000, 1700000002000]
+
+
+def test_depth_history_features_uses_tick_tolerance_and_snapshot_mid():
+    snaps = [
+        {
+            "timestamp": 1,
+            "bids": [["100.0", "50"], ["99.9", "10"]],
+            "asks": [["100.1", "40"], ["100.2", "8"]],
+        },
+        {
+            "timestamp": 2,
+            "bids": [["100.1", "52"], ["100.0", "10"]],
+            "asks": [["100.2", "41"], ["100.3", "8"]],
+        },
+        {
+            "timestamp": 3,
+            "bids": [["100.2", "54"], ["100.1", "10"]],
+            "asks": [["100.3", "42"], ["100.4", "8"]],
+        },
+    ]
+    # p is intentionally far; function should use per-snapshot mid, not this static p.
+    out = collector.compute_depth_history_features(
+        snaps,
+        p=1000.0,
+        levels=2,
+        tick_size=0.1,
+        tick_tolerance_ticks=2,
+        band_pct=0.002,
+    )
+
+    assert out["available"] is True
+    assert out["bidWall"]["samples"] == 3
+    assert out["askWall"]["samples"] == 3
+    assert out["bidWall"]["persistRate"] == 1.0
+    assert out["askWall"]["persistRate"] == 1.0
+    assert out["tickSizeUsed"] == 0.1
+    assert out["tickToleranceTicks"] == 2
 
 
 def test_extract_symbol_info_and_market_info():
